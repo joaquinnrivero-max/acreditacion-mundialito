@@ -105,9 +105,9 @@
     pointer-events: none;
   }
   .cam-guide .mrz-frame {
-    width: 88%;
-    height: 24%;
-    margin-top: 30%;
+    width: 90%;
+    height: 40%;
+    margin-top: 42%;
     border: 2px dashed rgba(255,255,255,0.55);
     border-radius: 8px;
   }
@@ -399,7 +399,7 @@
     <div class="cam-wrap">
       <video id="video" autoplay playsinline muted></video>
       <div class="cam-guide"><div class="mrz-frame"></div></div>
-      <div class="cam-status" id="cam-status">Apuntá al dorso del DNI, a las 3 líneas de texto de abajo</div>
+      <div class="cam-status" id="cam-status">Acercá bien el DNI: que las 3 líneas de texto llenen el recuadro</div>
       <div class="cam-off hidden" id="cam-off">La cámara está apagada.<br>Tocá "Activar cámara" para escanear.</div>
     </div>
 
@@ -577,7 +577,7 @@
       cameraOn = true;
       els.camOff.classList.add("hidden");
       els.btnToggleCam.textContent = "Apagar cámara";
-      els.camStatus.textContent = "Apuntá al dorso del DNI, a las 3 líneas de texto de abajo";
+      els.camStatus.textContent = "Acercá bien el DNI: que las 3 líneas de texto llenen el recuadro";
       document.getElementById("capture-row").classList.remove("hidden");
     }).catch(function(err) {
       cameraOn = false;
@@ -621,16 +621,27 @@
     var ctxFull = canvasFull.getContext("2d");
     ctxFull.drawImage(video, 0, 0, canvasFull.width, canvasFull.height);
 
-    // Recortamos la franja donde el marco guía indica que está el MRZ
-    // (coincide con el .mrz-frame del CSS: arranca al 30% de alto, mide 24%)
-    var recorteY = Math.floor(canvasFull.height * 0.28);
-    var recorteAlto = Math.floor(canvasFull.height * 0.30);
+    // Recortamos generosamente la mitad inferior del DNI: como la resolución
+    // de captura no siempre coincide en proporción con lo que se ve en
+    // pantalla, usamos un margen amplio para asegurar que las 3 líneas del
+    // MRZ entren completas, aunque quede de más arriba.
+    var recorteY = Math.floor(canvasFull.height * 0.45);
+    var recorteAlto = Math.floor(canvasFull.height * 0.55);
+
+    // Agrandamos el recorte (x2) antes de pasarlo al OCR: el texto del MRZ
+    // suele ocupar pocos píxeles reales, y agrandarlo ayuda a Tesseract a
+    // distinguir mejor los caracteres.
+    var factorEscala = 2;
     var canvasRecorte = document.createElement("canvas");
-    canvasRecorte.width = canvasFull.width;
-    canvasRecorte.height = recorteAlto;
+    canvasRecorte.width = canvasFull.width * factorEscala;
+    canvasRecorte.height = recorteAlto * factorEscala;
     var ctxRecorte = canvasRecorte.getContext("2d");
-    // Aumentamos contraste/escala de gris para ayudar al OCR
-    ctxRecorte.drawImage(canvasFull, 0, recorteY, canvasFull.width, recorteAlto, 0, 0, canvasFull.width, recorteAlto);
+    ctxRecorte.imageSmoothingEnabled = true;
+    ctxRecorte.drawImage(
+      canvasFull,
+      0, recorteY, canvasFull.width, recorteAlto,
+      0, 0, canvasRecorte.width, canvasRecorte.height
+    );
     aplicarEscalaDeGrisYContraste(ctxRecorte, canvasRecorte.width, canvasRecorte.height);
 
     obtenerWorkerTesseract()
@@ -644,7 +655,7 @@
         mostrarDebugOCR(texto);
 
         if (!parsed || !parsed.dni) {
-          els.camStatus.textContent = "Apuntá al dorso del DNI, a las 3 líneas de texto de abajo";
+          els.camStatus.textContent = "Acercá bien el DNI: que las 3 líneas de texto llenen el recuadro";
           showToast("No se pudo leer bien. Mirá el texto detectado abajo.");
           return;
         }
@@ -654,7 +665,7 @@
       })
       .catch(function(err) {
         procesando = false;
-        els.camStatus.textContent = "Apuntá al dorso del DNI, a las 3 líneas de texto de abajo";
+        els.camStatus.textContent = "Acercá bien el DNI: que las 3 líneas de texto llenen el recuadro";
         showToast("Error leyendo la imagen. Probá de nuevo o buscá a mano.");
       });
   }
@@ -883,7 +894,7 @@
 
   function cerrarOverlay() {
     els.overlay.classList.add("hidden");
-    els.camStatus.textContent = "Apuntá al dorso del DNI, a las 3 líneas de texto de abajo";
+    els.camStatus.textContent = "Acercá bien el DNI: que las 3 líneas de texto llenen el recuadro";
     els.inputDni.value = "";
   }
 
