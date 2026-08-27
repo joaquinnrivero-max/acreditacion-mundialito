@@ -411,6 +411,8 @@
       <button class="btn btn-primary" id="btn-capturar">📷 Capturar y leer</button>
     </div>
 
+    <div class="manual-panel hidden" id="debug-panel" style="font-family: monospace; font-size: 12px; white-space: pre-wrap; color: var(--text-dim);"></div>
+
     <div class="manual-panel hidden" id="manual-panel">
       <div class="manual-tabs">
         <div class="manual-tab active" id="tab-dni">Por DNI</div>
@@ -639,10 +641,11 @@
         var texto = res.data.text || "";
         var parsed = parsearMRZ(texto);
         procesando = false;
+        mostrarDebugOCR(texto);
 
         if (!parsed || !parsed.dni) {
           els.camStatus.textContent = "Apuntá al dorso del DNI, a las 3 líneas de texto de abajo";
-          showToast("No se pudo leer bien. Probá acercar más o con mejor luz.");
+          showToast("No se pudo leer bien. Mirá el texto detectado abajo.");
           return;
         }
 
@@ -654,6 +657,12 @@
         els.camStatus.textContent = "Apuntá al dorso del DNI, a las 3 líneas de texto de abajo";
         showToast("Error leyendo la imagen. Probá de nuevo o buscá a mano.");
       });
+  }
+
+  function mostrarDebugOCR(texto) {
+    var panel = document.getElementById("debug-panel");
+    panel.textContent = "Texto detectado por el lector (diagnóstico):\n\n" + (texto || "(vacío)");
+    panel.classList.remove("hidden");
   }
 
   function aplicarEscalaDeGrisYContraste(ctx, w, h) {
