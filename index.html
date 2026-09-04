@@ -4,7 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Acreditación · Mundialito Senior Pilar 2026</title>
-<script src="https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.3/dist/iife/reader/index.js"></script>
+<!-- Lector de código PDF417. Los dos archivos viven en este mismo repositorio
+       a propósito: si se bajaran de un servidor externo, un corte de internet o
+       una caída de ese servidor dejaría a los puestos sin poder escanear. -->
+  <script src="zxing-reader.js"></script>
 <style>
   :root {
     --bg: #0f1410;
@@ -692,7 +695,11 @@
       els.camStatus.textContent = "No se pudo cargar el lector. Revisá la conexión y recargá.";
       return;
     }
-    ZXingWASM.prepareZXingModule({ fireImmediately: true })
+    ZXingWASM.prepareZXingModule({
+      // Sin esto, la librería iría a buscar el .wasm a un servidor externo.
+      overrides: { locateFile: function() { return "zxing_reader.wasm"; } },
+      fireImmediately: true
+    })
       .then(function() {
         lectorListo = true;
         if (cameraOn) els.camStatus.textContent = MSG_SCAN;
