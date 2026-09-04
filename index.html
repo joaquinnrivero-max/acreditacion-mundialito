@@ -529,6 +529,9 @@
   var scanCanvas = document.createElement("canvas");
   var scanCtx = scanCanvas.getContext("2d", { willReadFrequently: true });
   var ultimaLectura = { texto: "", ts: 0 };
+  // Datos del último DNI escaneado. Se usan para registrar en la planilla a
+  // quien no figura en el listado. Queda en null si la búsqueda fue a mano.
+  var datosEscaneo = null;
 
   function showToast(msg, ms) {
     els.toast.textContent = msg;
@@ -774,6 +777,7 @@
     }
 
     procesando = true;
+    datosEscaneo = datos;
     if (navigator.vibrate) { try { navigator.vibrate(60); } catch (e) {} }
     els.camStatus.textContent = "Leído: DNI " + datos.dni +
       (datos.nombreCompleto ? " (" + datos.nombreCompleto + ")" : "") + " — consultando…";
@@ -822,12 +826,33 @@
 
     // Apellido y nombre: en las dos disposiciones son los campos 2 y 3.
     var soloLetras = /^[A-ZÁÉÍÓÚÑÜ' .-]{2,}$/i;
-    var nombreCompleto = null;
-    if (partes.length >= 3 && soloLetras.test(partes[1])) {
-      nombreCompleto = partes[1] + (soloLetras.test(partes[2]) ? ", " + partes[2] : "");
+    var apellido = (partes.length >= 2 && soloLetras.test(partes[1])) ? partes[1] : "";
+    var nombre = (partes.length >= 3 && soloLetras.test(partes[2])) ? partes[2] : "";
+    var nombreCompleto = apellido ? (apellido + (nombre ? ", " + nombre : "")) : null;
+
+    // Sexo: primer campo de una sola letra M/F/X. Aparece antes que el
+    // ejemplar (A, B, C…) en las dos disposiciones, así que no se confunden.
+    var sexo = "";
+    for (var s = 0; s < partes.length; s++) {
+      if (/^[MFX]$/i.test(partes[s])) { sexo = partes[s].toUpperCase(); break; }
     }
 
-    return { dni: dni, nombreCompleto: nombreCompleto };
+    // Fecha de nacimiento: primera fecha dd/mm/aaaa del string. La fecha de
+    // emisión viene después, así que la primera siempre es la de nacimiento.
+    var fechaNac = "";
+    for (var f = 0; f < partes.length; f++) {
+      if (/^\d{2}\/\d{2}\/\d{4}$/.test(partes[f])) { fechaNac = partes[f]; break; }
+    }
+
+    return {
+      dni: dni,
+      apellido: apellido,
+      nombre: nombre,
+      sexo: sexo,
+      fechaNac: fechaNac,
+      nombreCompleto: nombreCompleto,
+      crudo: String(texto)
+    };
   }
 
   function mostrarDebugCodigo(texto) {
@@ -856,11 +881,13 @@
         titulo: "No encontrado",
         nombre: "DNI " + dni,
         meta: "No figura en la base de inscriptos",
+        detalle: "Registrando para revisión…",
         acciones: [
           { texto: "Buscar por apellido", clase: "btn-primary", accion: function() { cerrarOverlay(); abrirManualApellido(); } },
           { texto: "Cerrar", clase: "", accion: cerrarOverlay }
         ]
       });
+      registrarNoEncontrado(dni);
       return;
     }
 
@@ -895,6 +922,37 @@
         { texto: "Cancelar", clase: "", accion: cerrarOverlay }
       ]
     });
+  }
+
+  // Deja constancia en la planilla de quien se presentó y no figura en el
+  // listado. Si vino de un escaneo mandamos todos los datos del código; si la
+  // búsqueda fue a mano, mandamos solamente el número.
+  function registrarNoEncontrado(dni) {
+    var d = (datosEscaneo && datosEscaneo.dni === dni) ? datosEscaneo : null;
+
+    apiCall({
+      accion: "registrarNoEncontrado",
+      dni: dni,
+      apellido: d ? d.apellido : "",
+      nombre: d ? d.nombre : "",
+      fechaNac: d ? d.fechaNac : "",
+      sexo: d ? d.sexo : "",
+      puesto: els.puestoSelect.value,
+      origen: d ? "escaneo" : "manual",
+      crudo: d ? d.crudo : ""
+    })
+      .then(function(res) {
+        if (res && res.ok) {
+          els.resultDetail.textContent = res.yaRegistrado
+            ? "Ya estaba anotado en NO INSCRIPTOS"
+            : "Anotado en la hoja NO INSCRIPTOS";
+        } else {
+          els.resultDetail.textContent = "No se pudo anotar — anotalo a mano";
+        }
+      })
+      .catch(function() {
+        els.resultDetail.textContent = "No se pudo anotar — anotalo a mano";
+      });
   }
 
   function confirmarRetiro(dni) {
@@ -1013,6 +1071,7 @@
   els.btnBuscarDni.addEventListener("click", function() {
     var val = normalizarDni(els.inputDni.value);
     if (!val) { showToast("Escribí un número de DNI"); return; }
+    datosEscaneo = null;
     buscarYMostrar(val);
   });
   els.inputDni.addEventListener("keydown", function(e) {
@@ -1051,6 +1110,7 @@
         "<div class=\"tag " + (it.yaRetirado ? "tag-usado" : "tag-libre") + "\">" +
         (it.yaRetirado ? "Ya retiró" : "Disponible") + "</div>";
       row.addEventListener("click", function() {
+        datosEscaneo = null;
         buscarYMostrar(it.dni);
       });
       els.apellidoResults.appendChild(row);
