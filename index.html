@@ -509,7 +509,20 @@
 <script>
 (function() {
   var STORAGE_KEY = "acreditacion_script_url";
-  var scriptUrl = localStorage.getItem(STORAGE_KEY) || "";
+  /* ===========================================================
+   * URL DEL SISTEMA — PEGAR ACÁ ABAJO, ENTRE LAS COMILLAS
+   * ===========================================================
+   * Poné la URL de tu Apps Script (la que termina en /exec).
+   * Con esto, ningún operador tiene que configurar nada: abren la
+   * página y ya está conectada.
+   *
+   * Ejemplo de cómo tiene que quedar:
+   *   var URL_DE_FABRICA = "https://script.google.com/macros/s/AKfy.../exec";
+   */
+  var URL_DE_FABRICA = "";
+
+  // Si alguien configuró una URL a mano en este celular, esa manda.
+  var scriptUrl = localStorage.getItem(STORAGE_KEY) || URL_DE_FABRICA || "";
 
   var els = {
     video: document.getElementById("video"),
@@ -693,6 +706,8 @@
     lineas.push("ESCANEO");
     lineas.push("  intentos de lectura: " + diag.intentos);
     lineas.push("  códigos leídos: " + diag.lecturas);
+    lineas.push("  tiempo por lectura: " + (diag.ultimoMs != null ? diag.ultimoMs + " ms" : "-"));
+    lineas.push("  modo: " + (diag.modo || "normal"));
     lineas.push("");
 
     lineas.push("ÚLTIMO ERROR");
@@ -1039,6 +1054,9 @@
   // --- Selección de cámara ---
 
   var CAM_KEY = "acreditacion_camara";
+  var yaAutoElegimos = false;
+  var escaneoLento = false;
+  var lentosSeguidos = 0;
 
   /**
    * Llena el desplegable con todas las cámaras del celular. Los nombres solo
@@ -1065,7 +1083,68 @@
 
       els.camSelectRow.classList.remove("hidden");
       diag.camarasDisponibles = camaras.length;
+
+      // Si el operador nunca eligió, elegimos nosotros la más probable.
+      // Se hace una sola vez por celular: después queda guardada.
+      if (!localStorage.getItem(CAM_KEY) && !yaAutoElegimos) {
+        yaAutoElegimos = true;
+        var mejor = elegirMejorCamara(camaras);
+        if (mejor && mejor.deviceId && mejor.deviceId !== actual) {
+          localStorage.setItem(CAM_KEY, mejor.deviceId);
+          diag.ultimoError = "";
+          showToast("Ajustando la cámara para leer mejor…");
+          detenerCamara();
+          setTimeout(iniciarCamara, 300);
+        } else if (mejor && mejor.deviceId) {
+          localStorage.setItem(CAM_KEY, mejor.deviceId);
+        }
+      }
     }).catch(function() {});
+  }
+
+  /**
+   * Elige sola la cámara que más probablemente sirva, para que el operador
+   * no tenga que probar una por una.
+   *
+   * El criterio sale de lo que verificamos en teléfonos reales:
+   *   - En Android, la trasera principal es la que el sistema numera 0.
+   *     Las otras suelen ser gran angular o macro, con foco fijo, que no
+   *     enfocan un DNI a diez centímetros.
+   *   - En iPhone, la "dual" o "triple" funciona porque el sistema cambia
+   *     de lente solo según la distancia.
+   *   - La ultra gran angular no sirve nunca para esto.
+   */
+  function puntuarCamara(etiqueta) {
+    var t = (etiqueta || "").toLowerCase();
+    var puntos = 0;
+
+    // Descarta directamente la ultra gran angular
+    if (t.indexOf("ultra") !== -1) puntos -= 10;
+
+    // Android: la cámara 0 trasera es la principal
+    if (/camera2?\s*0[,\s]/.test(t) || /\b0\b.*back/.test(t)) puntos += 5;
+
+    // iPhone: las virtuales dual/triple cambian de lente según la distancia
+    if (t.indexOf("dual") !== -1 || t.indexOf("triple") !== -1) puntos += 4;
+
+    // Cualquier trasera vale más que una frontal
+    if (t.indexOf("back") !== -1 || t.indexOf("trasera") !== -1 || t.indexOf("rear") !== -1) puntos += 2;
+    if (t.indexOf("front") !== -1 || t.indexOf("frontal") !== -1 || t.indexOf("delantera") !== -1) puntos -= 10;
+
+    // Las macro y las de profundidad no sirven para leer códigos
+    if (t.indexOf("macro") !== -1 || t.indexOf("depth") !== -1 || t.indexOf("telephoto") !== -1) puntos -= 4;
+
+    return puntos;
+  }
+
+  function elegirMejorCamara(camaras) {
+    var mejor = null;
+    var mejorPuntaje = -Infinity;
+    camaras.forEach(function(c) {
+      var p = puntuarCamara(c.label);
+      if (p > mejorPuntaje) { mejorPuntaje = p; mejor = c; }
+    });
+    return mejor;
   }
 
   els.camSelect.addEventListener("change", function() {
@@ -1105,7 +1184,21 @@
   // El PDF417 está en el FRENTE del DNI tarjeta, en la franja inferior.
   // Se lee en continuo desde el video: el operador apunta y no toca nada.
 
-  var OPCIONES_LECTOR = {
+  // Lectura rápida: el DNI casi siempre se apoya horizontal, así que no vale
+  // la pena gastar tiempo probando rotaciones en cada cuadro.
+  var OPCIONES_RAPIDA = {
+    formats: ["PDF417"],
+    tryHarder: true,
+    tryRotate: false,
+    tryInvert: false,
+    tryDownscale: true,
+    maxNumberOfSymbols: 1,
+    characterSet: "ISO8859_1"
+  };
+
+  // Lectura a fondo: se usa cada tantos intentos, por si el operador apoyó
+  // el documento de costado. Es más lenta, por eso no va en todos los cuadros.
+  var OPCIONES_FONDO = {
     formats: ["PDF417"],
     tryHarder: true,
     tryRotate: true,
@@ -1163,9 +1256,10 @@
     var video = els.video;
     if (!video.videoWidth || !video.videoHeight) { programarProximoTick(300); return; }
 
-    // Escalamos a un máximo de 1600 px de ancho: más que eso no mejora la
-    // lectura y hace lento el escaneo en celulares viejos.
-    var maxAncho = 1600;
+    // Escalamos según lo que aguante el celular. Si los cuadros vienen
+    // tardando, bajamos la resolución: en un teléfono lento, escanear más
+    // chico y más seguido lee antes que escanear grande y espaciado.
+    var maxAncho = escaneoLento ? 1100 : 1600;
     var escala = Math.min(1, maxAncho / video.videoWidth);
     var w = Math.round(video.videoWidth * escala);
     var h = Math.round(video.videoHeight * escala);
@@ -1186,8 +1280,13 @@
     diag.intentos++;
     diag.resolucion = video.videoWidth + "x" + video.videoHeight;
 
-    ZXingWASM.readBarcodes(imageData, OPCIONES_LECTOR)
+    // Cada cuarto intento probamos también rotado, por si el DNI está de lado.
+    var opciones = (diag.intentos % 4 === 0) ? OPCIONES_FONDO : OPCIONES_RAPIDA;
+    var arrancoEn = Date.now();
+
+    ZXingWASM.readBarcodes(imageData, opciones)
       .then(function(resultados) {
+        medirVelocidad(Date.now() - arrancoEn);
         if (!cameraOn) return;
         if (!resultados || !resultados.length || !resultados[0].text) {
           programarProximoTick(150);
@@ -1199,6 +1298,24 @@
         diag.ultimoError = "Lectura: " + (err && err.message ? err.message : String(err));
         programarProximoTick(400);
       });
+  }
+
+  /**
+   * Mide cuánto tarda cada lectura y, si el celular no da abasto, baja la
+   * resolución de escaneo. Un teléfono de 2018 no puede con lo mismo que
+   * uno de 2024, y es preferible que lea más chico a que no lea.
+   */
+  function medirVelocidad(ms) {
+    diag.ultimoMs = ms;
+    if (ms > 700 && !escaneoLento) {
+      lentosSeguidos++;
+      if (lentosSeguidos >= 3) {
+        escaneoLento = true;
+        diag.modo = "reducido (el celular no daba abasto)";
+      }
+    } else if (ms < 400) {
+      lentosSeguidos = 0;
+    }
   }
 
   function manejarLecturaCodigo(textoCrudo) {
