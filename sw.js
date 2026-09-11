@@ -15,7 +15,7 @@
  * vieja que tienen guardada y no se van a enterar del cambio.
  */
 
-const VERSION = "v4";
+const VERSION = "v5";
 const CACHE = "acreditacion-" + VERSION;
 
 const ARCHIVOS = [

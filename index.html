@@ -656,6 +656,7 @@
     // Reintento de la cola.
     setInterval(function() {
       if (obtenerCola().length) sincronizarCola(true);
+      if (obtenerColaNI().length) sincronizarNoInscriptos(true);
     }, REINTENTO_MS);
   }
 
@@ -663,7 +664,9 @@
   window.addEventListener("online", function() {
     hayConexion = true;
     actualizarEstadoBase();
-    sincronizarCola(false).then(function() { descargarBase(true); });
+    sincronizarCola(false)
+      .then(function() { return sincronizarNoInscriptos(true); })
+      .then(function() { descargarBase(true); });
   });
 
   window.addEventListener("offline", function() {
@@ -674,8 +677,13 @@
   // Tocando la línea de estado se fuerza una sincronización a mano.
   els.baseStatus.addEventListener("click", function() {
     if (!scriptUrl) return;
-    if (obtenerCola().length) sincronizarCola(false);
-    else descargarBase(false);
+    if (obtenerCola().length) {
+      sincronizarCola(false).then(function() { return sincronizarNoInscriptos(true); });
+    } else if (obtenerColaNI().length) {
+      sincronizarNoInscriptos(false);
+    } else {
+      descargarBase(false);
+    }
   });
   els.baseStatus.style.cursor = "pointer";
 
@@ -830,7 +838,10 @@
 
   var BASE_KEY = "acreditacion_base";
   var COLA_KEY = "acreditacion_cola";
-  var TIMEOUT_MS = 6000;
+  // Cola aparte para la gente que no figura en el listado y se presentó
+  // mientras el celular estaba sin señal. Antes esto se le pedía al operador
+  // que lo anotara en un papel, y un papel se pierde.
+  var COLA_NI_KEY = "acreditacion_cola_noinscriptos";
   var REFRESCO_MS = 5 * 60 * 1000;   // cada cuánto se rebaja la base estando online
   var REINTENTO_MS = 20 * 1000;      // cada cuánto se reintenta vaciar la cola
 
@@ -865,6 +876,9 @@
   function obtenerCola() { return leerJSON(COLA_KEY, []); }
   function guardarCola(c) { return guardarJSON(COLA_KEY, c); }
 
+  function obtenerColaNI() { return leerJSON(COLA_NI_KEY, []); }
+  function guardarColaNI(c) { return guardarJSON(COLA_NI_KEY, c); }
+
   function actualizarEstadoBase() {
     var cola = obtenerCola();
     var partes = [];
@@ -884,6 +898,12 @@
 
     if (cola.length) {
       partes.push(cola.length + " pulsera" + (cola.length > 1 ? "s" : "") + " sin sincronizar");
+      clases.push("pendientes");
+    }
+
+    var colaNI = obtenerColaNI();
+    if (colaNI.length) {
+      partes.push(colaNI.length + " no inscripto" + (colaNI.length > 1 ? "s" : "") + " sin registrar");
       clases.push("pendientes");
     }
 
@@ -981,6 +1001,81 @@
     guardarCola(cola);
     actualizarEstadoBase();
     return ahora;
+  }
+
+  /**
+   * Guarda en el celular a alguien que no figura en el listado, para
+   * registrarlo en la planilla cuando vuelva la conexión.
+   *
+   * Si el DNI vino de un escaneo tenemos apellido, nombre y fecha de
+   * nacimiento. Si el operador buscó a mano, solo el número.
+   */
+  function encolarNoEncontrado(dni) {
+    var d = (datosEscaneo && datosEscaneo.dni === dni) ? datosEscaneo : null;
+    var cola = obtenerColaNI();
+
+    for (var i = 0; i < cola.length; i++) {
+      if (cola[i].dni === dni) {
+        actualizarEstadoBase();
+        return false; // ya estaba anotado
+      }
+    }
+
+    cola.push({
+      dni: dni,
+      apellido: d ? d.apellido : "",
+      nombre: d ? d.nombre : "",
+      fechaNac: d ? d.fechaNac : "",
+      sexo: d ? d.sexo : "",
+      puesto: els.puestoSelect.value,
+      origen: d ? "escaneo sin conexión" : "manual sin conexión",
+      crudo: d ? d.crudo : "",
+      hora: new Date().toISOString()
+    });
+
+    guardarColaNI(cola);
+    actualizarEstadoBase();
+    return true;
+  }
+
+  /**
+   * Escribe en la planilla los no inscriptos que quedaron guardados.
+   * Van de a uno porque son pocos: lo normal es que esta cola esté vacía.
+   */
+  function sincronizarNoInscriptos(silencioso) {
+    var cola = obtenerColaNI();
+    if (!cola.length || !scriptUrl) return Promise.resolve();
+
+    var item = cola[0];
+
+    return apiCall({
+      accion: "registrarNoEncontrado",
+      dni: item.dni,
+      apellido: item.apellido || "",
+      nombre: item.nombre || "",
+      fechaNac: item.fechaNac || "",
+      sexo: item.sexo || "",
+      puesto: item.puesto || "",
+      origen: item.origen || "",
+      crudo: item.crudo || ""
+    })
+      .then(function(res) {
+        if (!res.ok) throw new Error(res.error || "Respuesta inválida");
+
+        guardarColaNI(obtenerColaNI().filter(function(x) { return x.dni !== item.dni; }));
+        actualizarEstadoBase();
+
+        // Si quedan más, seguimos con el siguiente, manteniendo el mismo
+        // criterio de aviso para que el operador reciba la confirmación
+        // recién al final y no una por cada uno.
+        if (obtenerColaNI().length) return sincronizarNoInscriptos(silencioso);
+        if (!silencioso) showToast("No inscriptos registrados en la planilla");
+      })
+      .catch(function(err) {
+        hayConexion = false;
+        actualizarEstadoBase();
+        if (!silencioso) showToast("No se pudo registrar: " + err.message);
+      });
   }
 
   /**
@@ -1512,10 +1607,14 @@
           { texto: "Cerrar", clase: "", accion: cerrarOverlay }
         ]
       });
-      // Sin conexión no registramos en la planilla: quedaría perdido. Se le
-      // avisa al operador para que lo anote a mano.
       if (res.offline) {
-        els.resultDetail.textContent = "SIN CONEXIÓN — anotá los datos a mano";
+        // Sin conexión no se puede escribir en la planilla ahora, pero sí
+        // guardarlo para escribirlo después. El operador no tiene que anotar
+        // nada en papel ni acordarse de nada.
+        var nuevo = encolarNoEncontrado(dni);
+        els.resultDetail.textContent = nuevo
+          ? "SIN CONEXIÓN — guardado, se registra cuando vuelva la señal"
+          : "SIN CONEXIÓN — ya estaba guardado para registrar";
       } else {
         registrarNoEncontrado(dni);
       }
