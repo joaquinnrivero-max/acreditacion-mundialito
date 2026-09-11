@@ -107,6 +107,18 @@
     justify-content: center;
     pointer-events: none;
   }
+  #base-status { font-size: 12px; opacity: 0.75; margin-top: 2px; }
+  #base-status.offline {
+    opacity: 1;
+    color: #ffcf6b;
+    font-weight: 600;
+  }
+  #base-status.pendientes {
+    opacity: 1;
+    color: #ff9d6b;
+    font-weight: 600;
+  }
+
   .cam-guide .card-frame {
     position: relative;
     width: 88%;
@@ -395,6 +407,7 @@
   <header>
     <h1>Acreditación · Mundialito Senior Pilar 2026</h1>
     <div class="sub" id="conn-status">Configurando conexión…</div>
+    <div class="sub" id="base-status">Base local: sin descargar</div>
     <div class="puesto-row">
       <label for="puesto-select">Puesto</label>
       <select id="puesto-select">
@@ -424,6 +437,13 @@
       <button class="btn" id="btn-torch">🔦 Encender luz</button>
     </div>
 
+    <!-- Los Android suelen exponer varias cámaras traseras y el navegador no
+         siempre elige la buena. Acá se puede cambiar a mano. -->
+    <div class="puesto-row hidden" id="cam-select-row">
+      <label for="cam-select">Cámara</label>
+      <select id="cam-select"></select>
+    </div>
+
     <div class="manual-panel hidden" id="debug-panel" style="font-family: monospace; font-size: 12px; white-space: pre-wrap; color: var(--text-dim);"></div>
 
     <div class="manual-panel hidden" id="manual-panel">
@@ -447,6 +467,12 @@
         <div class="apellido-results" id="apellido-results"></div>
       </div>
     </div>
+
+    <div class="footer-link">
+      <button id="btn-toggle-diag">Ver diagnóstico técnico</button>
+    </div>
+
+    <div class="manual-panel hidden" id="diag-panel" style="font-family: monospace; font-size: 12px; white-space: pre-wrap; color: var(--text-dim);"></div>
 
     <div class="footer-link">
       <button id="btn-toggle-cfg">Configurar URL del sistema</button>
@@ -513,6 +539,11 @@
     resultActions: document.getElementById("result-actions"),
     toast: document.getElementById("toast"),
     connStatus: document.getElementById("conn-status"),
+    baseStatus: document.getElementById("base-status"),
+    camSelect: document.getElementById("cam-select"),
+    camSelectRow: document.getElementById("cam-select-row"),
+    diagPanel: document.getElementById("diag-panel"),
+    btnToggleDiag: document.getElementById("btn-toggle-diag"),
     puestoSelect: document.getElementById("puesto-select"),
     btnToggleCfg: document.getElementById("btn-toggle-cfg"),
     cfgPanel: document.getElementById("cfg-panel"),
@@ -532,6 +563,16 @@
   var scanCanvas = document.createElement("canvas");
   var scanCtx = scanCanvas.getContext("2d", { willReadFrequently: true });
   var ultimaLectura = { texto: "", ts: 0 };
+
+  // Contadores para el panel de diagnóstico
+  var diag = {
+    intentos: 0,
+    lecturas: 0,
+    ultimoError: "",
+    camaraUsada: "",
+    resolucion: "",
+    arranqueLector: "sin empezar"
+  };
   // Datos del último DNI escaneado. Se usan para registrar en la planilla a
   // quien no figura en el listado. Queda en null si la búsqueda fue a mano.
   var datosEscaneo = null;
@@ -563,6 +604,103 @@
     localStorage.setItem(PUESTO_KEY, els.puestoSelect.value);
   });
 
+  /* --- Arranque del modo sin conexión --- */
+
+  // El service worker guarda la página y el lector dentro del celular, para
+  // que la acreditación abra aunque no haya nada de señal.
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("sw.js").catch(function() {
+      // Si falla, la página funciona igual mientras haya conexión.
+    });
+  }
+
+  cargarBaseLocal();
+
+  if (scriptUrl) {
+    // Al abrir: si no hay base o está vieja, se baja.
+    var vencida = !baseLocal ||
+      (Date.now() - new Date(baseLocal.descargada).getTime()) > REFRESCO_MS;
+    if (vencida) descargarBase(true);
+
+    // Refresco periódico, para enterarse de lo que marcaron los otros puestos.
+    setInterval(function() {
+      if (hayConexion && !obtenerCola().length) descargarBase(true);
+    }, REFRESCO_MS);
+
+    // Reintento de la cola.
+    setInterval(function() {
+      if (obtenerCola().length) sincronizarCola(true);
+    }, REINTENTO_MS);
+  }
+
+  // Cuando el celular avisa que volvió la conexión, sincronizamos enseguida.
+  window.addEventListener("online", function() {
+    hayConexion = true;
+    actualizarEstadoBase();
+    sincronizarCola(false).then(function() { descargarBase(true); });
+  });
+
+  window.addEventListener("offline", function() {
+    hayConexion = false;
+    actualizarEstadoBase();
+  });
+
+  // Tocando la línea de estado se fuerza una sincronización a mano.
+  els.baseStatus.addEventListener("click", function() {
+    if (!scriptUrl) return;
+    if (obtenerCola().length) sincronizarCola(false);
+    else descargarBase(false);
+  });
+  els.baseStatus.style.cursor = "pointer";
+
+  /* --- Panel de diagnóstico --- */
+
+  var diagTimer = null;
+
+  els.btnToggleDiag.addEventListener("click", function() {
+    var oculto = els.diagPanel.classList.toggle("hidden");
+    els.btnToggleDiag.textContent = oculto ? "Ver diagnóstico técnico" : "Ocultar diagnóstico";
+    if (oculto) {
+      clearInterval(diagTimer);
+      diagTimer = null;
+    } else {
+      pintarDiagnostico();
+      diagTimer = setInterval(pintarDiagnostico, 1000);
+    }
+  });
+
+  function pintarDiagnostico() {
+    var lineas = [];
+
+    lineas.push("NAVEGADOR");
+    lineas.push("  " + navigator.userAgent);
+    lineas.push("");
+
+    lineas.push("LECTOR DE CÓDIGOS");
+    lineas.push("  archivo zxing-reader.js: " + (typeof ZXingWASM !== "undefined" ? "cargado" : "NO CARGADO"));
+    lineas.push("  motor (.wasm): " + diag.arranqueLector);
+    lineas.push("  listo para leer: " + (lectorListo ? "SÍ" : "NO"));
+    lineas.push("");
+
+    lineas.push("CÁMARA");
+    lineas.push("  encendida: " + (cameraOn ? "SÍ" : "NO"));
+    lineas.push("  cámaras que ve el celular: " + (diag.camarasDisponibles || "?"));
+    lineas.push("  en uso: " + (diag.camaraUsada || "-"));
+    lineas.push("  resolución del video: " + (diag.resolucion || "-"));
+    lineas.push("  video listo: " + (els.video.videoWidth ? "SÍ" : "NO — el video no arrancó"));
+    lineas.push("");
+
+    lineas.push("ESCANEO");
+    lineas.push("  intentos de lectura: " + diag.intentos);
+    lineas.push("  códigos leídos: " + diag.lecturas);
+    lineas.push("");
+
+    lineas.push("ÚLTIMO ERROR");
+    lineas.push("  " + (diag.ultimoError || "(ninguno)"));
+
+    els.diagPanel.textContent = lineas.join("\n");
+  }
+
   els.btnToggleCfg.addEventListener("click", function() {
     els.cfgPanel.classList.toggle("hidden");
   });
@@ -587,10 +725,243 @@
     var url = scriptUrl + "?" + Object.keys(params)
       .map(function(k) { return encodeURIComponent(k) + "=" + encodeURIComponent(params[k]); })
       .join("&");
-    return fetch(url).then(function(r) {
-      if (!r.ok) throw new Error("Error de red (" + r.status + ")");
-      return r.json();
+    // Sin límite de tiempo, con señal mala el operador se queda mirando la
+    // pantalla sin saber si va a contestar. A los 6 segundos cortamos y
+    // pasamos a la copia local.
+    return new Promise(function(resolver, rechazar) {
+      var cortado = false;
+      var reloj = setTimeout(function() {
+        cortado = true;
+        rechazar(new Error("La planilla no respondió a tiempo"));
+      }, TIMEOUT_MS);
+
+      fetch(url)
+        .then(function(r) {
+          if (!r.ok) throw new Error("Error de red (" + r.status + ")");
+          return r.json();
+        })
+        .then(function(json) {
+          if (cortado) return;
+          clearTimeout(reloj);
+          hayConexion = true;
+          resolver(json);
+        })
+        .catch(function(err) {
+          if (cortado) return;
+          clearTimeout(reloj);
+          rechazar(err);
+        });
     });
+  }
+
+  /* =========================================================
+   * MODO SIN CONEXIÓN
+   * =========================================================
+   * Tres piezas que trabajan juntas:
+   *   1. baseLocal — copia de la lista de inscriptos guardada en el celular.
+   *   2. cola      — pulseras entregadas durante un corte, esperando escribirse.
+   *   3. hayConexion — si la última llamada a la planilla funcionó.
+   */
+
+  var BASE_KEY = "acreditacion_base";
+  var COLA_KEY = "acreditacion_cola";
+  var TIMEOUT_MS = 6000;
+  var REFRESCO_MS = 5 * 60 * 1000;   // cada cuánto se rebaja la base estando online
+  var REINTENTO_MS = 20 * 1000;      // cada cuánto se reintenta vaciar la cola
+
+  var hayConexion = true;
+  var baseLocal = null;
+  var descargando = false;
+
+  function leerJSON(clave, porDefecto) {
+    try {
+      var txt = localStorage.getItem(clave);
+      return txt ? JSON.parse(txt) : porDefecto;
+    } catch (e) {
+      return porDefecto;
+    }
+  }
+
+  function guardarJSON(clave, valor) {
+    try {
+      localStorage.setItem(clave, JSON.stringify(valor));
+      return true;
+    } catch (e) {
+      showToast("No hay espacio en el celular para guardar la base");
+      return false;
+    }
+  }
+
+  function cargarBaseLocal() {
+    baseLocal = leerJSON(BASE_KEY, null);
+    actualizarEstadoBase();
+  }
+
+  function obtenerCola() { return leerJSON(COLA_KEY, []); }
+  function guardarCola(c) { return guardarJSON(COLA_KEY, c); }
+
+  function actualizarEstadoBase() {
+    var cola = obtenerCola();
+    var partes = [];
+    var clases = [];
+
+    if (baseLocal && baseLocal.jugadores) {
+      var cuando = new Date(baseLocal.descargada);
+      partes.push("Base local: " + baseLocal.cantidad + " inscriptos (" + formatearHoraCorta(cuando) + ")");
+    } else {
+      partes.push("Base local: sin descargar");
+    }
+
+    if (!hayConexion) {
+      partes.push("SIN CONEXIÓN — trabajando con la copia del celular");
+      clases.push("offline");
+    }
+
+    if (cola.length) {
+      partes.push(cola.length + " pulsera" + (cola.length > 1 ? "s" : "") + " sin sincronizar");
+      clases.push("pendientes");
+    }
+
+    els.baseStatus.textContent = partes.join(" · ");
+    els.baseStatus.className = "sub " + clases.join(" ");
+  }
+
+  function formatearHoraCorta(fecha) {
+    if (!fecha || isNaN(fecha.getTime())) return "?";
+    return ("0" + fecha.getHours()).slice(-2) + ":" + ("0" + fecha.getMinutes()).slice(-2);
+  }
+
+  /**
+   * Baja la lista completa de inscriptos y la guarda en el celular.
+   */
+  function descargarBase(silencioso) {
+    if (!scriptUrl || descargando) return Promise.resolve(false);
+    descargando = true;
+    if (!silencioso) els.baseStatus.textContent = "Descargando la base…";
+
+    return apiCall({ accion: "descargarBase" })
+      .then(function(res) {
+        if (!res.ok || !res.jugadores) throw new Error(res.error || "Respuesta inválida");
+
+        var indice = {};
+        for (var i = 0; i < res.jugadores.length; i++) {
+          indice[res.jugadores[i].d] = res.jugadores[i];
+        }
+
+        baseLocal = {
+          descargada: new Date().toISOString(),
+          cantidad: res.jugadores.length,
+          jugadores: indice
+        };
+        guardarJSON(BASE_KEY, baseLocal);
+        actualizarEstadoBase();
+        if (!silencioso) showToast("Base descargada: " + res.jugadores.length + " inscriptos");
+        return true;
+      })
+      .catch(function(err) {
+        hayConexion = false;
+        actualizarEstadoBase();
+        if (!silencioso) showToast("No se pudo descargar la base: " + err.message);
+        return false;
+      })
+      .then(function(r) { descargando = false; return r; });
+  }
+
+  /**
+   * Busca un DNI en la copia guardada. Devuelve una respuesta con la misma
+   * forma que la del servidor, para que el resto de la página no tenga que
+   * saber de dónde salió el dato.
+   */
+  function buscarEnBaseLocal(dni) {
+    if (!baseLocal || !baseLocal.jugadores) return null;
+    var j = baseLocal.jugadores[dni];
+    if (!j) return { ok: true, encontrado: false, dni: dni, offline: true };
+
+    return {
+      ok: true,
+      encontrado: true,
+      offline: true,
+      hoja: j.h,
+      dni: dni,
+      apellido: j.a,
+      nombre: j.n,
+      equipo: j.e,
+      categoria: j.c,
+      yaRetirado: j.r === 1,
+      horaRetiro: j.rh || null,
+      puestoRetiro: j.rp || null
+    };
+  }
+
+  /**
+   * Marca a alguien como retirado en la copia local y lo pone en la cola
+   * para escribirlo en la planilla cuando vuelva la conexión.
+   */
+  function marcarEnBaseLocal(dni, puesto) {
+    var ahora = new Date();
+
+    if (baseLocal && baseLocal.jugadores && baseLocal.jugadores[dni]) {
+      baseLocal.jugadores[dni].r = 1;
+      baseLocal.jugadores[dni].rh = ahora.toISOString();
+      baseLocal.jugadores[dni].rp = puesto;
+      guardarJSON(BASE_KEY, baseLocal);
+    }
+
+    var cola = obtenerCola();
+    for (var i = 0; i < cola.length; i++) {
+      if (cola[i].dni === dni) { actualizarEstadoBase(); return ahora; }
+    }
+    cola.push({ dni: dni, puesto: puesto, hora: ahora.toISOString() });
+    guardarCola(cola);
+    actualizarEstadoBase();
+    return ahora;
+  }
+
+  /**
+   * Intenta escribir en la planilla todo lo que quedó en la cola.
+   * Se llama sola cada tanto y cuando vuelve la conexión.
+   */
+  function sincronizarCola(silencioso) {
+    var cola = obtenerCola();
+    if (!cola.length || !scriptUrl) return Promise.resolve();
+
+    var lote = cola.slice(0, 20);
+
+    return apiCall({ accion: "sincronizar", pendientes: JSON.stringify(lote) })
+      .then(function(res) {
+        if (!res.ok) throw new Error(res.error || "Respuesta inválida");
+
+        var escritos = 0;
+        var conflictos = [];
+
+        (res.resultados || []).forEach(function(r) {
+          if (r.estado === "ESCRITO") escritos++;
+          if (r.estado === "YA_ESTABA") conflictos.push(r.dni + " (lo marcó " + (r.puestoRetiro || "otro puesto") + ")");
+          if (r.estado === "NO_ENCONTRADO") conflictos.push(r.dni + " (no está en la base)");
+        });
+
+        // Sacamos de la cola todo lo que se procesó, haya salido bien o haya
+        // dado conflicto: reintentarlo no va a cambiar el resultado.
+        var procesados = {};
+        (res.resultados || []).forEach(function(r) { procesados[r.dni] = true; });
+        guardarCola(obtenerCola().filter(function(item) { return !procesados[item.dni]; }));
+
+        actualizarEstadoBase();
+
+        if (!silencioso || conflictos.length) {
+          var msg = escritos + " pulsera" + (escritos === 1 ? "" : "s") + " sincronizada" + (escritos === 1 ? "" : "s");
+          if (conflictos.length) msg += " · REVISAR: " + conflictos.join(", ");
+          showToast(msg);
+        }
+
+        // Si quedaron más de 20, seguimos con el resto.
+        if (obtenerCola().length) return sincronizarCola(true);
+      })
+      .catch(function(err) {
+        hayConexion = false;
+        actualizarEstadoBase();
+        if (!silencioso) showToast("No se pudo sincronizar: " + err.message);
+      });
   }
 
   // --- Cámara ---
@@ -603,19 +974,35 @@
     }
     // Pedimos la mayor resolución posible: las barras del PDF417 son finas y
     // con 720p muchas veces no llegan a distinguirse.
-    navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: { ideal: "environment" },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
-        focusMode: "continuous"
-      }
-    }).then(function(stream) {
+    // Si el operador ya eligió una cámara, la respetamos. Si no, pedimos la
+    // trasera y después dejamos que elija, porque en Android "la trasera"
+    // puede ser la gran angular, que no resuelve las barras del código.
+    var camGuardada = localStorage.getItem(CAM_KEY);
+    var restriccionesVideo = camGuardada
+      ? { deviceId: { exact: camGuardada }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+      : { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } };
+
+    navigator.mediaDevices.getUserMedia({ video: restriccionesVideo })
+      .then(function(stream) {
       mediaStream = stream;
       videoTrack = stream.getVideoTracks()[0] || null;
       els.video.srcObject = stream;
       var p = els.video.play();
       if (p && p.catch) p.catch(function() {});
+
+      // El enfoque continuo se pide por separado: si viniera dentro del pedido
+      // original y el celular no lo soportara, podría fallar todo el arranque.
+      if (videoTrack && videoTrack.applyConstraints) {
+        videoTrack.applyConstraints({ advanced: [{ focusMode: "continuous" }] })
+          .catch(function() {});
+      }
+
+      if (videoTrack) {
+        var ajustes = videoTrack.getSettings ? videoTrack.getSettings() : {};
+        diag.camaraUsada = videoTrack.label || "(sin nombre)";
+        diag.resolucion = (ajustes.width || "?") + "x" + (ajustes.height || "?");
+      }
+      listarCamaras();
       cameraOn = true;
       els.camOff.classList.add("hidden");
       els.btnToggleCam.textContent = "Apagar cámara";
@@ -623,6 +1010,7 @@
       prepararTorch();
       iniciarLoopEscaneo();
     }).catch(function(err) {
+      diag.ultimoError = "Cámara: " + (err && err.name ? err.name + " — " : "") + (err && err.message ? err.message : String(err));
       cameraOn = false;
       els.camOff.classList.remove("hidden");
       els.btnToggleCam.textContent = "Activar cámara";
@@ -646,6 +1034,45 @@
 
   els.btnToggleCam.addEventListener("click", function() {
     if (cameraOn) detenerCamara(); else iniciarCamara();
+  });
+
+  // --- Selección de cámara ---
+
+  var CAM_KEY = "acreditacion_camara";
+
+  /**
+   * Llena el desplegable con todas las cámaras del celular. Los nombres solo
+   * están disponibles después de que el usuario dio permiso, por eso se llama
+   * recién cuando la cámara ya arrancó.
+   */
+  function listarCamaras() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+
+    navigator.mediaDevices.enumerateDevices().then(function(dispositivos) {
+      var camaras = dispositivos.filter(function(d) { return d.kind === "videoinput"; });
+      if (camaras.length < 2) { els.camSelectRow.classList.add("hidden"); return; }
+
+      var actual = videoTrack && videoTrack.getSettings ? videoTrack.getSettings().deviceId : null;
+      els.camSelect.innerHTML = "";
+
+      camaras.forEach(function(c, i) {
+        var op = document.createElement("option");
+        op.value = c.deviceId;
+        op.textContent = c.label || ("Cámara " + (i + 1));
+        if (c.deviceId === actual) op.selected = true;
+        els.camSelect.appendChild(op);
+      });
+
+      els.camSelectRow.classList.remove("hidden");
+      diag.camarasDisponibles = camaras.length;
+    }).catch(function() {});
+  }
+
+  els.camSelect.addEventListener("change", function() {
+    localStorage.setItem(CAM_KEY, els.camSelect.value);
+    showToast("Cambiando de cámara…");
+    detenerCamara();
+    setTimeout(iniciarCamara, 300);
   });
 
   // --- Linterna (solo si el navegador la soporta; iOS normalmente no) ---
@@ -692,9 +1119,11 @@
   // día del evento no haya espera en el primer escaneo.
   function precalentarLector() {
     if (typeof ZXingWASM === "undefined") {
+      diag.arranqueLector = "FALLÓ — el archivo zxing-reader.js no se cargó";
       els.camStatus.textContent = "No se pudo cargar el lector. Revisá la conexión y recargá.";
       return;
     }
+    diag.arranqueLector = "descargando el motor…";
     ZXingWASM.prepareZXingModule({
       // Sin esto, la librería iría a buscar el .wasm a un servidor externo.
       overrides: { locateFile: function() { return "zxing_reader.wasm"; } },
@@ -702,9 +1131,12 @@
     })
       .then(function() {
         lectorListo = true;
+        diag.arranqueLector = "LISTO";
         if (cameraOn) els.camStatus.textContent = MSG_SCAN;
       })
-      .catch(function() {
+      .catch(function(err) {
+        diag.arranqueLector = "FALLÓ — " + (err && err.message ? err.message : String(err));
+        diag.ultimoError = diag.arranqueLector;
         els.camStatus.textContent = "No se pudo cargar el lector. Usá la búsqueda a mano.";
       });
   }
@@ -751,6 +1183,9 @@
       return;
     }
 
+    diag.intentos++;
+    diag.resolucion = video.videoWidth + "x" + video.videoHeight;
+
     ZXingWASM.readBarcodes(imageData, OPCIONES_LECTOR)
       .then(function(resultados) {
         if (!cameraOn) return;
@@ -760,12 +1195,14 @@
         }
         manejarLecturaCodigo(resultados[0].text);
       })
-      .catch(function() {
+      .catch(function(err) {
+        diag.ultimoError = "Lectura: " + (err && err.message ? err.message : String(err));
         programarProximoTick(400);
       });
   }
 
   function manejarLecturaCodigo(textoCrudo) {
+    diag.lecturas++;
     var ahora = Date.now();
     // Evita re-disparar con el mismo DNI si el operador dejó la tarjeta quieta
     if (textoCrudo === ultimaLectura.texto && ahora - ultimaLectura.ts < 4000) {
@@ -870,13 +1307,26 @@
 
   function buscarYMostrar(dni) {
     dni = normalizarDni(dni);
+
+    // Siempre se intenta primero contra la planilla: es la única fuente que
+    // sabe lo que hicieron los otros puestos. La copia local es el respaldo.
     apiCall({ accion: "buscar", dni: dni })
       .then(function(res) {
         if (!res.ok) throw new Error(res.error || "Respuesta inválida");
+        if (!hayConexion) { hayConexion = true; actualizarEstadoBase(); }
         mostrarResultadoBusqueda(res, dni);
       })
       .catch(function(err) {
-        mostrarError(err.message);
+        hayConexion = false;
+        actualizarEstadoBase();
+
+        var local = buscarEnBaseLocal(dni);
+        if (!local) {
+          // Sin conexión y sin copia guardada no hay nada que hacer.
+          mostrarError(err.message + " — y este celular no tiene la base descargada");
+          return;
+        }
+        mostrarResultadoBusqueda(local, dni);
       });
   }
 
@@ -894,7 +1344,13 @@
           { texto: "Cerrar", clase: "", accion: cerrarOverlay }
         ]
       });
-      registrarNoEncontrado(dni);
+      // Sin conexión no registramos en la planilla: quedaría perdido. Se le
+      // avisa al operador para que lo anote a mano.
+      if (res.offline) {
+        els.resultDetail.textContent = "SIN CONEXIÓN — anotá los datos a mano";
+      } else {
+        registrarNoEncontrado(dni);
+      }
       return;
     }
 
@@ -980,6 +1436,14 @@
           return;
         }
 
+        // Mantenemos la copia local al día, así si se corta la conexión
+        // justo después el celular ya sabe que esta persona retiró.
+        if (baseLocal && baseLocal.jugadores && baseLocal.jugadores[dni]) {
+          baseLocal.jugadores[dni].r = 1;
+          baseLocal.jugadores[dni].rp = els.puestoSelect.value;
+          guardarJSON(BASE_KEY, baseLocal);
+        }
+
         var dupHtml = res.duplicadoDetectado
           ? res.duplicadoDetectado
           : null;
@@ -996,7 +1460,22 @@
         });
       })
       .catch(function(err) {
-        mostrarError(err.message);
+        // No se pudo escribir en la planilla. En vez de dejar al operador
+        // trabado con la fila esperando, se anota localmente y se manda
+        // después. La pulsera se entrega igual.
+        hayConexion = false;
+        var puesto = els.puestoSelect.value;
+        var hora = marcarEnBaseLocal(dni, puesto);
+
+        mostrarOverlay({
+          tipo: "warn",
+          icono: "⚠",
+          titulo: "Entregá la pulsera",
+          nombre: "Guardado en el celular",
+          meta: "Sin conexión — se va a escribir en la planilla cuando vuelva la señal",
+          detalle: "Puesto: " + puesto + " · " + formatearHoraCorta(hora),
+          acciones: [{ texto: "Listo — siguiente", clase: "btn-primary", accion: cerrarOverlay }]
+        });
       });
   }
 
