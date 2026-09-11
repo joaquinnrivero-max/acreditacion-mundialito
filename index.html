@@ -600,10 +600,14 @@
   }
 
   function updateConnStatus() {
-    if (scriptUrl) {
-      els.connStatus.textContent = "Conectado a la planilla";
-    } else {
+    if (!scriptUrl) {
       els.connStatus.textContent = "Sin configurar — tocá \"Configurar URL del sistema\"";
+    } else if (!hayConexion) {
+      // Antes decía "Conectado a la planilla" aun cuando las consultas se
+      // estaban cortando, y quedaban dos mensajes contradictorios a la vez.
+      els.connStatus.textContent = "La planilla no está respondiendo";
+    } else {
+      els.connStatus.textContent = "Conectado a la planilla";
     }
   }
   updateConnStatus();
@@ -633,7 +637,16 @@
     // Al abrir: si no hay base o está vieja, se baja.
     var vencida = !baseLocal ||
       (Date.now() - new Date(baseLocal.descargada).getTime()) > REFRESCO_MS;
-    if (vencida) descargarBase(true);
+
+    // La primera descarga no es silenciosa: si el celular está recién abierto
+    // y la planilla tarda en despertar, el operador tiene que ver que está
+    // pasando algo en vez de una pantalla que parece rota.
+    if (vencida) {
+      els.baseStatus.textContent = baseLocal
+        ? "Actualizando la base…"
+        : "Descargando la base por primera vez (puede tardar unos segundos)…";
+      descargarBase(!!baseLocal);
+    }
 
     // Refresco periódico, para enterarse de lo que marcaron los otros puestos.
     setInterval(function() {
@@ -733,22 +746,59 @@
     return String(v || "").replace(/[.\s]/g, "").trim();
   }
 
+  /**
+   * Cuánto esperamos a la planilla, según la acción.
+   *
+   * Apps Script se "duerme" cuando hace rato que nadie lo usa, y despertarlo
+   * puede llevar entre 5 y 15 segundos. Después de la primera consulta
+   * responde en menos de uno. Por eso los números son generosos: cortar
+   * antes de tiempo hace creer que no hay internet cuando sí lo hay.
+   */
+  var TIEMPOS = {
+    buscar: 15000,
+    buscarApellido: 15000,
+    marcar: 20000,
+    registrarNoEncontrado: 20000,
+    descargarBase: 60000,
+    sincronizar: 45000
+  };
+
+  // Estas se pueden repetir sin consecuencias porque solo leen. Las que
+  // escriben en la planilla NO se reintentan solas: si la primera llegó,
+  // un reintento generaría confusión sobre quién marcó qué.
+  var REINTENTABLES = { buscar: 1, buscarApellido: 1, descargarBase: 1 };
+
   function apiCall(params) {
     if (!scriptUrl) {
       return Promise.reject(new Error("Falta configurar la URL del sistema"));
     }
+    return intentarLlamada(params, REINTENTABLES[params.accion] ? 2 : 1);
+  }
+
+  function intentarLlamada(params, intentosRestantes) {
+    return llamadaUnica(params).catch(function(err) {
+      if (intentosRestantes > 1) {
+        // El primer pedido puede haber despertado al servidor. El segundo
+        // suele contestar enseguida.
+        return intentarLlamada(params, intentosRestantes - 1);
+      }
+      throw err;
+    });
+  }
+
+  function llamadaUnica(params) {
     var url = scriptUrl + "?" + Object.keys(params)
       .map(function(k) { return encodeURIComponent(k) + "=" + encodeURIComponent(params[k]); })
       .join("&");
-    // Sin límite de tiempo, con señal mala el operador se queda mirando la
-    // pantalla sin saber si va a contestar. A los 6 segundos cortamos y
-    // pasamos a la copia local.
+
+    var limite = TIEMPOS[params.accion] || 15000;
+
     return new Promise(function(resolver, rechazar) {
       var cortado = false;
       var reloj = setTimeout(function() {
         cortado = true;
-        rechazar(new Error("La planilla no respondió a tiempo"));
-      }, TIMEOUT_MS);
+        rechazar(new Error("La planilla tardó más de " + Math.round(limite / 1000) + " segundos en responder"));
+      }, limite);
 
       fetch(url)
         .then(function(r) {
@@ -758,7 +808,7 @@
         .then(function(json) {
           if (cortado) return;
           clearTimeout(reloj);
-          hayConexion = true;
+          if (!hayConexion) { hayConexion = true; actualizarEstadoBase(); }
           resolver(json);
         })
         .catch(function(err) {
@@ -839,6 +889,7 @@
 
     els.baseStatus.textContent = partes.join(" · ");
     els.baseStatus.className = "sub " + clases.join(" ");
+    updateConnStatus();
   }
 
   function formatearHoraCorta(fecha) {
