@@ -804,6 +804,9 @@
   var descargando = false;
   var relojDescarga = null;
   var fallaDescarga = "";
+  var sincronizando = false;     // candado de la cola de pulseras
+  var sincronizandoNI = false;   // candado de la cola de no inscriptos
+  var fallosSeguidos = 0;        // para espaciar los reintentos
 
   function leerJSON(clave, porDefecto) {
     try {
@@ -1050,6 +1053,8 @@
   function sincronizarNoInscriptos(silencioso) {
     var cola = obtenerColaNI();
     if (!cola.length || !scriptUrl) return Promise.resolve();
+    if (sincronizandoNI) return Promise.resolve();
+    sincronizandoNI = true;
 
     var item = cola[0];
 
@@ -1073,14 +1078,18 @@
         // Si quedan más, seguimos con el siguiente, manteniendo el mismo
         // criterio de aviso para que el operador reciba la confirmación
         // recién al final y no una por cada uno.
-        if (obtenerColaNI().length) return sincronizarNoInscriptos(silencioso);
+        if (obtenerColaNI().length) {
+          sincronizandoNI = false;
+          return sincronizarNoInscriptos(silencioso);
+        }
         if (!silencioso) showToast("No inscriptos registrados en la planilla");
       })
       .catch(function(err) {
         hayConexion = false;
         actualizarEstadoBase();
         if (!silencioso) showToast("No se pudo registrar: " + err.message);
-      });
+      })
+      .then(function() { sincronizandoNI = false; });
   }
 
   /**
@@ -1090,6 +1099,13 @@
   function sincronizarCola(silencioso) {
     var cola = obtenerCola();
     if (!cola.length || !scriptUrl) return Promise.resolve();
+
+    // Sin este candado, el reintento cada 20 segundos arrancaba una
+    // sincronización nueva aunque la anterior siguiera en curso. Las dos
+    // mandaban lo mismo, la segunda encontraba todo ya escrito, y quedaba
+    // registrado como si dos puestos hubieran entregado la misma pulsera.
+    if (sincronizando) return Promise.resolve();
+    sincronizando = true;
 
     var lote = cola.slice(0, 20);
 
@@ -1102,6 +1118,8 @@
 
         (res.resultados || []).forEach(function(r) {
           if (r.estado === "ESCRITO") escritos++;
+          // Un reenvío del propio puesto ya estaba escrito: cuenta como hecho.
+          if (r.estado === "YA_ESTABA_MISMO_PUESTO") escritos++;
           if (r.estado === "YA_ESTABA") conflictos.push(r.dni + " (lo marcó " + (r.puestoRetiro || "otro puesto") + ")");
           if (r.estado === "NO_ENCONTRADO") conflictos.push(r.dni + " (no está en la base)");
         });
@@ -1120,14 +1138,23 @@
           showToast(msg);
         }
 
+        fallosSeguidos = 0;
+
         // Si quedaron más de 20, seguimos con el resto.
-        if (obtenerCola().length) return sincronizarCola(true);
+        if (obtenerCola().length) {
+          sincronizando = false;
+          return sincronizarCola(true);
+        }
       })
       .catch(function(err) {
         hayConexion = false;
+        // Cada fallo espacia el próximo intento. Reintentar cada 20 segundos
+        // contra una planilla que no contesta solo empeora la congestión.
+        fallosSeguidos++;
         actualizarEstadoBase();
         if (!silencioso) showToast("No se pudo sincronizar: " + err.message);
-      });
+      })
+      .then(function() { sincronizando = false; });
   }
 
   // --- Cámara ---
@@ -1931,7 +1958,13 @@
     }, REFRESCO_MS);
 
     // Reintento de la cola.
+    var tickReintento = 0;
     setInterval(function() {
+      tickReintento++;
+      // Con fallos seguidos se espera cada vez más: 20s, 40s, 60s, hasta 2min.
+      var cadaCuantos = Math.min(6, fallosSeguidos + 1);
+      if (tickReintento % cadaCuantos !== 0) return;
+
       if (obtenerCola().length) sincronizarCola(true);
       if (obtenerColaNI().length) sincronizarNoInscriptos(true);
     }, REINTENTO_MS);
