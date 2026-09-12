@@ -519,7 +519,7 @@
    * Ejemplo de cómo tiene que quedar:
    *   var URL_DE_FABRICA = "https://script.google.com/macros/s/AKfy.../exec";
    */
-  var URL_DE_FABRICA = "https://script.google.com/macros/s/AKfycbxTKXhUtUztYyuADFsDpB_udzf_AyBFdEKkUZKmYu0PyDgr-GcaBwK9IV8VEds6u25u/exec";
+  var URL_DE_FABRICA = "https://script.google.com/macros/s/AKfycbyYtrSJ9v52ht8lVkJAf1nTuYjxtLvfeBY1K9iSeoxQS3xkr9Zj3eVASsctnWtpM_Em/exec";
 
   // Si alguien configuró una URL a mano en este celular, esa manda.
   var scriptUrl = localStorage.getItem(STORAGE_KEY) || URL_DE_FABRICA || "";
@@ -736,6 +736,11 @@
     lineas.push("  última consulta: " + (hayConexion ? "respondió" : "no respondió"));
     lineas.push("  base local: " + (baseLocal ? baseLocal.cantidad + " inscriptos" : "sin descargar"));
     lineas.push("  última descarga tardó: " + (diag.ultimaDescargaMs != null ? Math.round(diag.ultimaDescargaMs / 1000) + "s" : "-"));
+    if (diag.tramos && diag.tramos.length) {
+      diag.tramos.forEach(function(t) { lineas.push("    tramo " + t); });
+    } else {
+      lineas.push("    tramos: ninguno llegó");
+    }
     lineas.push("  pulseras en cola: " + obtenerCola().length);
     lineas.push("  no inscriptos en cola: " + obtenerColaNI().length);
     lineas.push("");
@@ -778,14 +783,16 @@
     registrarNoEncontrado: 20000,
     // 25 segundos y un reintento: 50 en el peor caso. Antes eran 60 más el
     // reintento, o sea dos minutos en los que la pantalla parecía colgada.
-    descargarBase: 25000,
+    descargarBase: 30000,
     sincronizar: 45000
   };
 
   // Estas se pueden repetir sin consecuencias porque solo leen. Las que
   // escriben en la planilla NO se reintentan solas: si la primera llegó,
   // un reintento generaría confusión sobre quién marcó qué.
-  var REINTENTABLES = { buscar: 1, buscarApellido: 1, descargarBase: 1 };
+  // descargarBase quedó afuera a propósito: se pide de a tramos, y si un
+  // tramo falla conviene enterarse rápido en vez de esperar el doble.
+  var REINTENTABLES = { buscar: 1, buscarApellido: 1 };
 
   function apiCall(params) {
     if (!scriptUrl) {
@@ -952,7 +959,7 @@
       els.baseStatus.textContent = "Descargando la base… 0s";
       relojDescarga = setInterval(function() {
         var seg = Math.round((Date.now() - arranque) / 1000);
-        els.baseStatus.textContent = "Descargando la base… " + seg + "s";
+        els.baseStatus.textContent = "Descargando la base… " + progresoDescarga + " · " + seg + "s";
       }, 1000);
     }
 
@@ -960,10 +967,15 @@
     // Google la corta. Vamos pidiendo pedazos hasta completarla.
     var indice = {};
     var acumulados = 0;
+    var progresoDescarga = "";
+    diag.tramos = [];
 
     function pedirTramo(desde) {
+      var t0 = Date.now();
       return apiCall({ accion: "descargarBase", desde: desde, cantidad: TRAMO_BASE })
         .then(function(res) {
+          diag.tramos.push("desde " + desde + ": " + Math.round((Date.now() - t0) / 1000) + "s, " +
+                           (res.jugadores ? res.jugadores.length : 0) + " jugadores");
           if (!res.ok || !res.jugadores) throw new Error(res.error || "Respuesta inválida");
 
           for (var i = 0; i < res.jugadores.length; i++) {
@@ -971,9 +983,7 @@
           }
           acumulados += res.jugadores.length;
 
-          if (!silencioso && res.total) {
-            els.baseStatus.textContent = "Descargando la base… " + acumulados + " de " + res.total;
-          }
+          if (res.total) progresoDescarga = acumulados + " de " + res.total;
 
           // Se corta si no hay más, o si un tramo vino vacío (para no quedar
           // dando vueltas si el servidor devuelve algo raro).
