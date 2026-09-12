@@ -621,71 +621,6 @@
     localStorage.setItem(PUESTO_KEY, els.puestoSelect.value);
   });
 
-  /* --- Arranque del modo sin conexión --- */
-
-  // El service worker guarda la página y el lector dentro del celular, para
-  // que la acreditación abra aunque no haya nada de señal.
-  if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("sw.js").catch(function() {
-      // Si falla, la página funciona igual mientras haya conexión.
-    });
-  }
-
-  cargarBaseLocal();
-
-  if (scriptUrl) {
-    // Al abrir: si no hay base o está vieja, se baja.
-    var vencida = !baseLocal ||
-      (Date.now() - new Date(baseLocal.descargada).getTime()) > REFRESCO_MS;
-
-    // La primera descarga no es silenciosa: si el celular está recién abierto
-    // y la planilla tarda en despertar, el operador tiene que ver que está
-    // pasando algo en vez de una pantalla que parece rota.
-    if (vencida) {
-      els.baseStatus.textContent = baseLocal
-        ? "Actualizando la base…"
-        : "Descargando la base por primera vez (puede tardar unos segundos)…";
-      descargarBase(!!baseLocal);
-    }
-
-    // Refresco periódico, para enterarse de lo que marcaron los otros puestos.
-    setInterval(function() {
-      if (hayConexion && !obtenerCola().length) descargarBase(true);
-    }, REFRESCO_MS);
-
-    // Reintento de la cola.
-    setInterval(function() {
-      if (obtenerCola().length) sincronizarCola(true);
-      if (obtenerColaNI().length) sincronizarNoInscriptos(true);
-    }, REINTENTO_MS);
-  }
-
-  // Cuando el celular avisa que volvió la conexión, sincronizamos enseguida.
-  window.addEventListener("online", function() {
-    hayConexion = true;
-    actualizarEstadoBase();
-    sincronizarCola(false)
-      .then(function() { return sincronizarNoInscriptos(true); })
-      .then(function() { descargarBase(true); });
-  });
-
-  window.addEventListener("offline", function() {
-    hayConexion = false;
-    actualizarEstadoBase();
-  });
-
-  // Tocando la línea de estado se fuerza una sincronización a mano.
-  els.baseStatus.addEventListener("click", function() {
-    if (!scriptUrl) return;
-    if (obtenerCola().length) {
-      sincronizarCola(false).then(function() { return sincronizarNoInscriptos(true); });
-    } else if (obtenerColaNI().length) {
-      sincronizarNoInscriptos(false);
-    } else {
-      descargarBase(false);
-    }
-  });
-  els.baseStatus.style.cursor = "pointer";
 
   /* --- Panel de diagnóstico --- */
 
@@ -1939,6 +1874,95 @@
       els.apellidoResults.appendChild(row);
     });
   }
+
+  // Red de seguridad: si algo revienta, que se vea en pantalla en vez de
+  // dejar media aplicación muerta en silencio. Esta noche perdimos horas
+  // persiguiendo un error que se manifestaba como "la cámara no abre".
+  window.addEventListener("error", function(e) {
+    var msg = (e && e.message ? e.message : "error desconocido") +
+              (e && e.lineno ? " (línea " + e.lineno + ")" : "");
+    diag.ultimoError = "FALLA EN LA PÁGINA: " + msg;
+    try {
+      els.connStatus.textContent = "Hay un problema en la aplicación — abrí el diagnóstico";
+      els.connStatus.style.color = "#ff6b6b";
+    } catch (x) {}
+  });
+
+  /* =========================================================
+   * ARRANQUE
+   * =========================================================
+   * Esto va al FINAL a propósito. Acá se hacen las primeras llamadas a la
+   * planilla, y si estuviera más arriba se ejecutaría antes de que estén
+   * definidas las constantes que esas llamadas necesitan. Cuando eso pasa,
+   * el error corta la carga del archivo y todo lo que viene después —
+   * incluido el botón de la cámara — queda sin conectar.
+   */
+
+  /* --- Arranque del modo sin conexión --- */
+
+  // El service worker guarda la página y el lector dentro del celular, para
+  // que la acreditación abra aunque no haya nada de señal.
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("sw.js").catch(function() {
+      // Si falla, la página funciona igual mientras haya conexión.
+    });
+  }
+
+  cargarBaseLocal();
+
+  if (scriptUrl) {
+    // Al abrir: si no hay base o está vieja, se baja.
+    var vencida = !baseLocal ||
+      (Date.now() - new Date(baseLocal.descargada).getTime()) > REFRESCO_MS;
+
+    // La primera descarga no es silenciosa: si el celular está recién abierto
+    // y la planilla tarda en despertar, el operador tiene que ver que está
+    // pasando algo en vez de una pantalla que parece rota.
+    if (vencida) {
+      els.baseStatus.textContent = baseLocal
+        ? "Actualizando la base…"
+        : "Descargando la base por primera vez (puede tardar unos segundos)…";
+      descargarBase(!!baseLocal);
+    }
+
+    // Refresco periódico, para enterarse de lo que marcaron los otros puestos.
+    setInterval(function() {
+      if (hayConexion && !obtenerCola().length) descargarBase(true);
+    }, REFRESCO_MS);
+
+    // Reintento de la cola.
+    setInterval(function() {
+      if (obtenerCola().length) sincronizarCola(true);
+      if (obtenerColaNI().length) sincronizarNoInscriptos(true);
+    }, REINTENTO_MS);
+  }
+
+  // Cuando el celular avisa que volvió la conexión, sincronizamos enseguida.
+  window.addEventListener("online", function() {
+    hayConexion = true;
+    actualizarEstadoBase();
+    sincronizarCola(false)
+      .then(function() { return sincronizarNoInscriptos(true); })
+      .then(function() { descargarBase(true); });
+  });
+
+  window.addEventListener("offline", function() {
+    hayConexion = false;
+    actualizarEstadoBase();
+  });
+
+  // Tocando la línea de estado se fuerza una sincronización a mano.
+  els.baseStatus.addEventListener("click", function() {
+    if (!scriptUrl) return;
+    if (obtenerCola().length) {
+      sincronizarCola(false).then(function() { return sincronizarNoInscriptos(true); });
+    } else if (obtenerColaNI().length) {
+      sincronizarNoInscriptos(false);
+    } else {
+      descargarBase(false);
+    }
+  });
+  els.baseStatus.style.cursor = "pointer";
 
 })();
 </script>
