@@ -731,6 +731,15 @@
     lineas.push("  modo: " + (diag.modo || "normal"));
     lineas.push("");
 
+    lineas.push("PLANILLA");
+    lineas.push("  URL configurada: " + (scriptUrl ? "sí" : "NO"));
+    lineas.push("  última consulta: " + (hayConexion ? "respondió" : "no respondió"));
+    lineas.push("  base local: " + (baseLocal ? baseLocal.cantidad + " inscriptos" : "sin descargar"));
+    lineas.push("  última descarga tardó: " + (diag.ultimaDescargaMs != null ? Math.round(diag.ultimaDescargaMs / 1000) + "s" : "-"));
+    lineas.push("  pulseras en cola: " + obtenerCola().length);
+    lineas.push("  no inscriptos en cola: " + obtenerColaNI().length);
+    lineas.push("");
+
     lineas.push("ÚLTIMO ERROR");
     lineas.push("  " + (diag.ultimoError || "(ninguno)"));
 
@@ -767,7 +776,9 @@
     buscarApellido: 15000,
     marcar: 20000,
     registrarNoEncontrado: 20000,
-    descargarBase: 60000,
+    // 25 segundos y un reintento: 50 en el peor caso. Antes eran 60 más el
+    // reintento, o sea dos minutos en los que la pantalla parecía colgada.
+    descargarBase: 25000,
     sincronizar: 45000
   };
 
@@ -844,10 +855,13 @@
   var COLA_NI_KEY = "acreditacion_cola_noinscriptos";
   var REFRESCO_MS = 5 * 60 * 1000;   // cada cuánto se rebaja la base estando online
   var REINTENTO_MS = 20 * 1000;      // cada cuánto se reintenta vaciar la cola
+  var TRAMO_BASE = 200;              // de a cuántos inscriptos se baja la lista
 
   var hayConexion = true;
   var baseLocal = null;
   var descargando = false;
+  var relojDescarga = null;
+  var fallaDescarga = "";
 
   function leerJSON(clave, porDefecto) {
     try {
@@ -884,9 +898,14 @@
     var partes = [];
     var clases = [];
 
+    if (descargando) return; // mientras baja, manda el contador
+
     if (baseLocal && baseLocal.jugadores) {
       var cuando = new Date(baseLocal.descargada);
       partes.push("Base local: " + baseLocal.cantidad + " inscriptos (" + formatearHoraCorta(cuando) + ")");
+    } else if (fallaDescarga) {
+      partes.push("No se pudo bajar la base (" + fallaDescarga + ") — tocá acá para reintentar");
+      clases.push("offline");
     } else {
       partes.push("Base local: sin descargar");
     }
@@ -923,34 +942,75 @@
   function descargarBase(silencioso) {
     if (!scriptUrl || descargando) return Promise.resolve(false);
     descargando = true;
-    if (!silencioso) els.baseStatus.textContent = "Descargando la base…";
+    fallaDescarga = "";
+    var arranque = Date.now();
 
-    return apiCall({ accion: "descargarBase" })
-      .then(function(res) {
-        if (!res.ok || !res.jugadores) throw new Error(res.error || "Respuesta inválida");
+    // Un contador que avanza, para que se note la diferencia entre "está
+    // tardando" y "se colgó". Antes quedaba un texto fijo y no había forma
+    // de saber si seguía intentando.
+    if (!silencioso) {
+      els.baseStatus.textContent = "Descargando la base… 0s";
+      relojDescarga = setInterval(function() {
+        var seg = Math.round((Date.now() - arranque) / 1000);
+        els.baseStatus.textContent = "Descargando la base… " + seg + "s";
+      }, 1000);
+    }
 
-        var indice = {};
-        for (var i = 0; i < res.jugadores.length; i++) {
-          indice[res.jugadores[i].d] = res.jugadores[i];
-        }
+    // La base viene de a tramos: la respuesta entera es demasiado pesada y
+    // Google la corta. Vamos pidiendo pedazos hasta completarla.
+    var indice = {};
+    var acumulados = 0;
 
+    function pedirTramo(desde) {
+      return apiCall({ accion: "descargarBase", desde: desde, cantidad: TRAMO_BASE })
+        .then(function(res) {
+          if (!res.ok || !res.jugadores) throw new Error(res.error || "Respuesta inválida");
+
+          for (var i = 0; i < res.jugadores.length; i++) {
+            indice[res.jugadores[i].d] = res.jugadores[i];
+          }
+          acumulados += res.jugadores.length;
+
+          if (!silencioso && res.total) {
+            els.baseStatus.textContent = "Descargando la base… " + acumulados + " de " + res.total;
+          }
+
+          // Se corta si no hay más, o si un tramo vino vacío (para no quedar
+          // dando vueltas si el servidor devuelve algo raro).
+          if (res.hayMas && res.jugadores.length > 0) return pedirTramo(desde + res.jugadores.length);
+          return res.total || acumulados;
+        });
+    }
+
+    return pedirTramo(0)
+      .then(function(total) {
         baseLocal = {
           descargada: new Date().toISOString(),
-          cantidad: res.jugadores.length,
+          cantidad: acumulados,
           jugadores: indice
         };
         guardarJSON(BASE_KEY, baseLocal);
         actualizarEstadoBase();
-        if (!silencioso) showToast("Base descargada: " + res.jugadores.length + " inscriptos");
+        if (!silencioso) showToast("Base descargada: " + acumulados + " inscriptos");
         return true;
       })
       .catch(function(err) {
         hayConexion = false;
+        // Se guarda el motivo para mostrarlo en la cabecera y en el
+        // diagnóstico, en vez de que quede un cartel eterno de "descargando".
+        fallaDescarga = err.message || "error desconocido";
+        diag.ultimoError = "Descarga de la base: " + fallaDescarga;
         actualizarEstadoBase();
-        if (!silencioso) showToast("No se pudo descargar la base: " + err.message);
+        if (!silencioso) showToast("No se pudo descargar la base: " + fallaDescarga);
         return false;
       })
-      .then(function(r) { descargando = false; return r; });
+      .then(function(r) {
+        descargando = false;
+        if (relojDescarga) { clearInterval(relojDescarga); relojDescarga = null; }
+        diag.ultimaDescargaMs = Date.now() - arranque;
+        actualizarEstadoBase();
+        return r;
+      });
   }
 
   /**
