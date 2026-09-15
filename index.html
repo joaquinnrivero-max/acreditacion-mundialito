@@ -486,6 +486,13 @@
       <label for="input-url">URL del Apps Script</label>
       <input type="text" id="input-url" placeholder="https://script.google.com/macros/s/AKfycb.../exec">
       <button class="btn btn-primary" id="btn-guardar-url">Guardar</button>
+
+      <div class="cfg-note" style="margin-top:16px">
+        Durante el evento la app no vuelve a bajar la lista completa: pide
+        solo lo que cambió. Este botón fuerza una descarga entera. Sirve si
+        cargaron inscriptos nuevos en la planilla y este celular no los ve.
+      </div>
+      <button class="btn" id="btn-rebajar-base">Volver a bajar la lista completa</button>
     </div>
 
   </main>
@@ -557,6 +564,7 @@
     camSelectRow: document.getElementById("cam-select-row"),
     diagPanel: document.getElementById("diag-panel"),
     btnToggleDiag: document.getElementById("btn-toggle-diag"),
+    btnRebajarBase: document.getElementById("btn-rebajar-base"),
     puestoSelect: document.getElementById("puesto-select"),
     btnToggleCfg: document.getElementById("btn-toggle-cfg"),
     cfgPanel: document.getElementById("cfg-panel"),
@@ -584,7 +592,10 @@
     ultimoError: "",
     camaraUsada: "",
     resolucion: "",
-    arranqueLector: "sin empezar"
+    arranqueLector: "sin empezar",
+    ultimosCambios: "",
+    ultimaRespuestaCruda: "",
+    ultimoEstadoHTTP: null
   };
   // Datos del último DNI escaneado. Se usan para registrar en la planilla a
   // quien no figura en el listado. Queda en null si la búsqueda fue a mano.
@@ -676,18 +687,34 @@
     } else {
       lineas.push("    tramos: ninguno llegó");
     }
+    lineas.push("  últimos cambios: " + (diag.ultimosCambios || "-"));
+    lineas.push("  puesta al día: " + (baseLocal && baseLocal.sincronizada
+      ? formatearHoraCorta(new Date(baseLocal.sincronizada)) : "-"));
     lineas.push("  pulseras en cola: " + obtenerCola().length);
     lineas.push("  no inscriptos en cola: " + obtenerColaNI().length);
     lineas.push("");
 
     lineas.push("ÚLTIMO ERROR");
     lineas.push("  " + (diag.ultimoError || "(ninguno)"));
+    lineas.push("");
+
+    // Esto es lo que hay que mirar si la app deja de responder de golpe en
+    // todos los puestos a la vez. Google escribe el motivo real acá
+    // (cuota, limitación de tasa, app despublicada, permisos) y sin esto
+    // lo único que se veía era "no se pudo".
+    lineas.push("ÚLTIMA RESPUESTA QUE NO ERA JSON");
+    lineas.push("  " + (diag.ultimaRespuestaCruda || "(ninguna — todas las respuestas llegaron bien)"));
 
     els.diagPanel.textContent = lineas.join("\n");
   }
 
   els.btnToggleCfg.addEventListener("click", function() {
     els.cfgPanel.classList.toggle("hidden");
+  });
+  els.btnRebajarBase.addEventListener("click", function() {
+    if (!scriptUrl) { showToast("Falta configurar la URL"); return; }
+    els.cfgPanel.classList.add("hidden");
+    descargarBase(false);
   });
   els.btnGuardarUrl.addEventListener("click", function() {
     var val = els.inputUrl.value.trim();
@@ -704,6 +731,20 @@
   }
 
   /**
+   * Deja un texto largo en algo que entre en una pantalla de celular, sin
+   * etiquetas HTML. Se usa para mostrar el cuerpo de una respuesta fallida:
+   * el motivo de Google suele estar en las primeras líneas.
+   */
+  function recortar(txt) {
+    var limpio = String(txt || "")
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!limpio) return "(respuesta vacía)";
+    return limpio.length > 400 ? limpio.slice(0, 400) + "…" : limpio;
+  }
+
+  /**
    * Cuánto esperamos a la planilla, según la acción.
    *
    * Apps Script se "duerme" cuando hace rato que nadie lo usa, y despertarlo
@@ -714,6 +755,9 @@
   var TIEMPOS = {
     buscar: 15000,
     buscarApellido: 15000,
+    // La consulta de cambios trae poquísimo y corre en segundo plano: si
+    // tarda, que se corte rápido y se reintente en el próximo ciclo.
+    cambios: 15000,
     marcar: 20000,
     registrarNoEncontrado: 20000,
     // 25 segundos y un reintento: 50 en el peor caso. Antes eran 60 más el
@@ -727,7 +771,7 @@
   // un reintento generaría confusión sobre quién marcó qué.
   // descargarBase quedó afuera a propósito: se pide de a tramos, y si un
   // tramo falla conviene enterarse rápido en vez de esperar el doble.
-  var REINTENTABLES = { buscar: 1, buscarApellido: 1 };
+  var REINTENTABLES = { buscar: 1, buscarApellido: 1, cambios: 1 };
 
   function apiCall(params) {
     if (!scriptUrl) {
@@ -761,10 +805,27 @@
         rechazar(new Error("La planilla tardó más de " + Math.round(limite / 1000) + " segundos en responder"));
       }, limite);
 
+      // Se lee como TEXTO y después se convierte, en vez de usar r.json()
+      // directamente. Cuando Google devuelve una página de error en lugar de
+      // datos —cuota agotada, limitación de tasa, la app despublicada—, esa
+      // página trae el motivo escrito. Con r.json() reventaba con un
+      // "Unexpected token <" y el motivo se perdía. Ahora queda guardado y se
+      // puede leer en el panel de diagnóstico.
       fetch(url)
         .then(function(r) {
-          if (!r.ok) throw new Error("Error de red (" + r.status + ")");
-          return r.json();
+          diag.ultimoEstadoHTTP = r.status;
+          return r.text().then(function(txt) {
+            if (!r.ok) {
+              diag.ultimaRespuestaCruda = "HTTP " + r.status + " — " + recortar(txt);
+              throw new Error("Error de red (" + r.status + ")");
+            }
+            try {
+              return JSON.parse(txt);
+            } catch (e) {
+              diag.ultimaRespuestaCruda = "HTTP " + r.status + " — la respuesta no era JSON: " + recortar(txt);
+              throw new Error("La planilla devolvió una página en vez de datos");
+            }
+          });
         })
         .then(function(json) {
           if (cortado) return;
@@ -795,7 +856,19 @@
   // mientras el celular estaba sin señal. Antes esto se le pedía al operador
   // que lo anotara en un papel, y un papel se pierde.
   var COLA_NI_KEY = "acreditacion_cola_noinscriptos";
-  var REFRESCO_MS = 5 * 60 * 1000;   // cada cuánto se rebaja la base estando online
+  // Cada cuánto se le pregunta a la planilla QUÉ CAMBIÓ. Antes acá había un
+  // REFRESCO_MS de 5 minutos que rebajaba la lista entera: con 5 celulares y
+  // seis horas de evento eran casi cincuenta minutos de ejecución del script
+  // gastados en volver a bajar 728 filas que en su enorme mayoría no habían
+  // cambiado. Ahora se piden solamente los DNI marcados desde la última vez,
+  // que en un evento normal son unos pocos o ninguno.
+  var CAMBIOS_MS = 3 * 60 * 1000;
+
+  // Cada cuánto se considera que la copia local está tan vieja que conviene
+  // bajarla entera de nuevo en vez de pedir cambios. Es una red de seguridad
+  // para el celular que estuvo apagado, no algo que deba pasar en un evento.
+  var BASE_VENCIDA_MS = 12 * 60 * 60 * 1000;
+
   var REINTENTO_MS = 20 * 1000;      // cada cuánto se reintenta vaciar la cola
   var TRAMO_BASE = 200;              // de a cuántos inscriptos se baja la lista
 
@@ -846,7 +919,9 @@
     if (descargando) return; // mientras baja, manda el contador
 
     if (baseLocal && baseLocal.jugadores) {
-      var cuando = new Date(baseLocal.descargada);
+      // La hora que se muestra es la de la última puesta al día, no la de la
+      // descarga: es la que le dice al operador qué tan fresco es lo que ve.
+      var cuando = new Date(baseLocal.sincronizada || baseLocal.descargada);
       partes.push("Base local: " + baseLocal.cantidad + " inscriptos (" + formatearHoraCorta(cuando) + ")");
     } else if (fallaDescarga) {
       partes.push("No se pudo bajar la base (" + fallaDescarga + ") — tocá acá para reintentar");
@@ -906,6 +981,7 @@
     var indice = {};
     var acumulados = 0;
     var progresoDescarga = "";
+    var selloServidor = null;
     diag.tramos = [];
 
     function pedirTramo(desde) {
@@ -915,6 +991,13 @@
           diag.tramos.push("desde " + desde + ": " + Math.round((Date.now() - t0) / 1000) + "s, " +
                            (res.jugadores ? res.jugadores.length : 0) + " jugadores");
           if (!res.ok || !res.jugadores) throw new Error(res.error || "Respuesta inválida");
+
+          // El sello del PRIMER tramo es el punto de partida para pedir
+          // cambios. Se usa el primero y no el último a propósito: si alguien
+          // entrega una pulsera mientras la descarga está en curso, ese cambio
+          // vuelve a venir en la primera consulta de cambios. Preferimos que
+          // algo llegue dos veces a que se pierda.
+          if (selloServidor === null && res.generada) selloServidor = res.generada;
 
           for (var i = 0; i < res.jugadores.length; i++) {
             indice[res.jugadores[i].d] = res.jugadores[i];
@@ -934,6 +1017,11 @@
       .then(function(total) {
         baseLocal = {
           descargada: new Date().toISOString(),
+          // Hora del SERVIDOR, no del celular: es contra esto que se piden los
+          // cambios. Si el reloj del teléfono está adelantado dos minutos y
+          // usáramos su hora, se perderían los cambios de esos dos minutos sin
+          // que nadie se dé cuenta.
+          sello: selloServidor,
           cantidad: acumulados,
           jugadores: indice
         };
@@ -962,6 +1050,89 @@
   }
 
   /**
+   * Le pregunta a la planilla QUÉ CAMBIÓ desde la última vez, y lo aplica
+   * sobre la copia local.
+   *
+   * Esto reemplaza al refresco que rebajaba la lista entera. La respuesta
+   * típica son cero o unos pocos registros: los que otros puestos marcaron
+   * en los últimos minutos.
+   *
+   * Sirve para una sola cosa: que la pantalla amarilla de "ya acreditado"
+   * aparezca apenas se escanea, en vez de descubrirlo recién al confirmar.
+   * Que esto se atrase unos minutos no permite ninguna doble entrega — el
+   * marcado verifica siempre contra la planilla.
+   */
+  var pidiendoCambios = false;
+
+  function pedirCambios(silencioso) {
+    if (!scriptUrl || pidiendoCambios) return Promise.resolve(false);
+    if (!baseLocal || !baseLocal.jugadores) return Promise.resolve(false);
+
+    // Una base bajada por una versión anterior de la app no tiene sello del
+    // servidor. Se rebaja entera una vez y a partir de ahí sigue por cambios.
+    if (!baseLocal.sello) return descargarBase(silencioso);
+
+    pidiendoCambios = true;
+    var t0 = Date.now();
+
+    return apiCall({ accion: "cambios", desde: baseLocal.sello })
+      .then(function(res) {
+        if (!res.ok) throw new Error(res.error || "Respuesta inválida");
+
+        // El servidor puede pedir que se rebaje todo (por ejemplo si este
+        // celular estuvo apagado medio evento y los cambios son demasiados).
+        if (res.recargar) return descargarBase(silencioso);
+
+        var lista = res.cambios || [];
+        var nuevos = 0;
+        var desconocidos = 0;
+
+        for (var i = 0; i < lista.length; i++) {
+          var c = lista[i];
+          var j = baseLocal.jugadores[c.d];
+          if (!j) { desconocidos++; continue; }
+          if (j.r !== 1) nuevos++;
+          j.r = 1;
+          if (c.rh) j.rh = c.rh;
+          if (c.rp) j.rp = c.rp;
+        }
+
+        baseLocal.sello = res.ahora || baseLocal.sello;
+        baseLocal.sincronizada = new Date().toISOString();
+        guardarJSON(BASE_KEY, baseLocal);
+
+        diag.ultimosCambios = lista.length + " cambio" + (lista.length === 1 ? "" : "s") +
+          " (" + nuevos + " nuevos) en " + Math.round((Date.now() - t0) / 1000) + "s";
+
+        // Si vinieron marcados de gente que no está en la copia local, la base
+        // creció después de la descarga: cargaron inscriptos de último momento.
+        if (desconocidos > 0) {
+          diag.ultimosCambios += " — " + desconocidos + " de DNI que no están en la copia local";
+          return descargarBase(true);
+        }
+
+        actualizarEstadoBase();
+        if (!silencioso) {
+          showToast(nuevos
+            ? nuevos + " acreditación" + (nuevos === 1 ? "" : "es") + " de otros puestos"
+            : "Sin novedades de otros puestos");
+        }
+        return true;
+      })
+      .catch(function(err) {
+        hayConexion = false;
+        diag.ultimoError = "Consulta de cambios: " + (err.message || String(err));
+        actualizarEstadoBase();
+        if (!silencioso) showToast("No se pudieron traer los cambios: " + err.message);
+        return false;
+      })
+      .then(function(r) {
+        pidiendoCambios = false;
+        return r;
+      });
+  }
+
+  /**
    * Busca un DNI en la copia guardada. Devuelve una respuesta con la misma
    * forma que la del servidor, para que el resto de la página no tenga que
    * saber de dónde salió el dato.
@@ -969,12 +1140,12 @@
   function buscarEnBaseLocal(dni) {
     if (!baseLocal || !baseLocal.jugadores) return null;
     var j = baseLocal.jugadores[dni];
-    if (!j) return { ok: true, encontrado: false, dni: dni, offline: true };
+    if (!j) return { ok: true, encontrado: false, dni: dni, local: true };
 
     return {
       ok: true,
       encontrado: true,
-      offline: true,
+      local: true,
       hoja: j.h,
       dni: dni,
       apellido: j.a,
@@ -1600,27 +1771,84 @@
     panel.classList.remove("hidden");
   }
 
+  /**
+   * Resuelve un DNI contra la COPIA LOCAL, sin llamar a la planilla.
+   *
+   * Hasta la v8 esto era al revés: cada escaneo consultaba el servidor, que
+   * leía las 814 filas para devolver una. Eran ~1500 consultas en el evento,
+   * la mitad de todo el trabajo que le pedíamos a Google, y el operador
+   * esperando uno o dos segundos cada vez.
+   *
+   * Por qué es seguro sacarlas: la protección contra la doble entrega no vive
+   * acá, vive en el MARCADO. Cuando el operador toca "Confirmar y entregar
+   * pulsera", el servidor lee el estado real de esa fila antes de escribir y
+   * responde YA_RETIRADO si otro puesto se adelantó. Lo peor que puede pasar
+   * por mirar una copia de tres minutos de antigüedad es mostrar la pantalla
+   * verde y que al confirmar aparezca el aviso. Nadie se lleva dos pulseras.
+   *
+   * La excepción es el NO ENCONTRADO: ahí sí se pregunta a la planilla antes
+   * de mandar a alguien a la hoja NO INSCRIPTOS, porque puede haberse
+   * inscripto después de que este celular bajó la base.
+   */
   function buscarYMostrar(dni) {
     dni = normalizarDni(dni);
 
-    // Siempre se intenta primero contra la planilla: es la única fuente que
-    // sabe lo que hicieron los otros puestos. La copia local es el respaldo.
+    var local = buscarEnBaseLocal(dni);
+
+    // Sin copia local (celular recién abierto, descarga fallida) se trabaja
+    // como antes: todo contra la planilla.
+    if (!local) {
+      apiCall({ accion: "buscar", dni: dni })
+        .then(function(res) {
+          if (!res.ok) throw new Error(res.error || "Respuesta inválida");
+          mostrarResultadoBusqueda(res, dni);
+        })
+        .catch(function(err) {
+          hayConexion = false;
+          actualizarEstadoBase();
+          mostrarError(err.message + " — y este celular no tiene la base descargada");
+        });
+      return;
+    }
+
+    if (local.encontrado) {
+      mostrarResultadoBusqueda(local, dni);
+      return;
+    }
+
+    // No figura en la copia local. Antes de darlo por no inscripto,
+    // confirmarlo contra la planilla: son pocos casos y evita mandar a la
+    // hoja de no inscriptos a alguien que se anotó esta mañana.
+    if (!hayConexion) {
+      mostrarResultadoBusqueda(local, dni);
+      return;
+    }
+
     apiCall({ accion: "buscar", dni: dni })
       .then(function(res) {
         if (!res.ok) throw new Error(res.error || "Respuesta inválida");
-        if (!hayConexion) { hayConexion = true; actualizarEstadoBase(); }
+
+        // Apareció en la planilla y no estaba en la copia: se agrega, así el
+        // resto del evento este celular ya lo tiene.
+        if (res.encontrado && baseLocal && baseLocal.jugadores) {
+          baseLocal.jugadores[dni] = {
+            d: dni, a: res.apellido, n: res.nombre,
+            e: res.equipo, c: res.categoria, h: res.hoja,
+            r: res.yaRetirado ? 1 : 0,
+            rh: res.horaRetiro || null, rp: res.puestoRetiro || null
+          };
+          baseLocal.cantidad = (baseLocal.cantidad || 0) + 1;
+          guardarJSON(BASE_KEY, baseLocal);
+          actualizarEstadoBase();
+        }
+
         mostrarResultadoBusqueda(res, dni);
       })
       .catch(function(err) {
+        // No se pudo confirmar. Se sigue con lo que dice la copia local, que
+        // dejará el registro en la cola de no inscriptos.
         hayConexion = false;
         actualizarEstadoBase();
-
-        var local = buscarEnBaseLocal(dni);
-        if (!local) {
-          // Sin conexión y sin copia guardada no hay nada que hacer.
-          mostrarError(err.message + " — y este celular no tiene la base descargada");
-          return;
-        }
         mostrarResultadoBusqueda(local, dni);
       });
   }
@@ -1639,7 +1867,11 @@
           { texto: "Cerrar", clase: "", accion: cerrarOverlay }
         ]
       });
-      if (res.offline) {
+      // La decisión de encolar o registrar ahora depende del estado de la
+      // conexión, no de dónde salió el resultado. Desde que la búsqueda se
+      // resuelve contra la copia local, un "no encontrado" local ya no
+      // significa que estemos sin señal.
+      if (!hayConexion) {
         // Sin conexión no se puede escribir en la planilla ahora, pero sí
         // guardarlo para escribirlo después. El operador no tiene que anotar
         // nada en papel ni acordarse de nada.
@@ -1724,6 +1956,16 @@
         if (!res.ok) throw new Error(res.error || "Respuesta inválida");
 
         if (!res.marcado && res.motivo === "YA_RETIRADO") {
+          // Otro puesto se adelantó y nuestra copia local no se había
+          // enterado. Se corrige acá mismo, así el próximo escaneo de esta
+          // persona ya muestra la pantalla amarilla directamente.
+          if (baseLocal && baseLocal.jugadores && baseLocal.jugadores[dni]) {
+            baseLocal.jugadores[dni].r = 1;
+            baseLocal.jugadores[dni].rh = res.horaRetiro || null;
+            baseLocal.jugadores[dni].rp = res.puestoRetiro || null;
+            guardarJSON(BASE_KEY, baseLocal);
+          }
+
           mostrarOverlay({
             tipo: "warn",
             icono: "⚠",
@@ -1740,6 +1982,10 @@
         if (baseLocal && baseLocal.jugadores && baseLocal.jugadores[dni]) {
           baseLocal.jugadores[dni].r = 1;
           baseLocal.jugadores[dni].rp = els.puestoSelect.value;
+          // La hora también: sin esto, si la misma persona vuelve a pasar por
+          // este puesto, la pantalla amarilla decía "retirado el  en Puesto 2"
+          // con la fecha vacía.
+          baseLocal.jugadores[dni].rh = res.horaRetiro || new Date().toISOString();
           guardarJSON(BASE_KEY, baseLocal);
         }
 
@@ -1938,9 +2184,11 @@
   cargarBaseLocal();
 
   if (scriptUrl) {
-    // Al abrir: si no hay base o está vieja, se baja.
-    var vencida = !baseLocal ||
-      (Date.now() - new Date(baseLocal.descargada).getTime()) > REFRESCO_MS;
+    // Al abrir: la base entera se baja solo si no hay ninguna, si la que hay
+    // viene de una versión anterior de la app (sin sello del servidor), o si
+    // está tan vieja que no vale la pena ponerla al día de a cambios.
+    var vencida = !baseLocal || !baseLocal.sello ||
+      (Date.now() - new Date(baseLocal.descargada).getTime()) > BASE_VENCIDA_MS;
 
     // La primera descarga no es silenciosa: si el celular está recién abierto
     // y la planilla tarda en despertar, el operador tiene que ver que está
@@ -1950,12 +2198,15 @@
         ? "Actualizando la base…"
         : "Descargando la base por primera vez (puede tardar unos segundos)…";
       descargarBase(!!baseLocal);
+    } else {
+      // Ya hay copia: alcanza con preguntar qué cambió desde la última vez.
+      pedirCambios(true);
     }
 
-    // Refresco periódico, para enterarse de lo que marcaron los otros puestos.
+    // Puesta al día periódica. Ya no rebaja la lista: pide solo lo que cambió.
     setInterval(function() {
-      if (hayConexion && !obtenerCola().length) descargarBase(true);
-    }, REFRESCO_MS);
+      if (hayConexion && !obtenerCola().length) pedirCambios(true);
+    }, CAMBIOS_MS);
 
     // Reintento de la cola.
     var tickReintento = 0;
@@ -1976,7 +2227,7 @@
     actualizarEstadoBase();
     sincronizarCola(false)
       .then(function() { return sincronizarNoInscriptos(true); })
-      .then(function() { descargarBase(true); });
+      .then(function() { pedirCambios(true); });
   });
 
   window.addEventListener("offline", function() {
@@ -1991,6 +2242,11 @@
       sincronizarCola(false).then(function() { return sincronizarNoInscriptos(true); });
     } else if (obtenerColaNI().length) {
       sincronizarNoInscriptos(false);
+    } else if (baseLocal && baseLocal.sello) {
+      // Con base ya descargada, tocar la línea de estado trae los cambios.
+      // Para rebajar la lista entera a mano está el botón del panel de
+      // configuración.
+      pedirCambios(false);
     } else {
       descargarBase(false);
     }
